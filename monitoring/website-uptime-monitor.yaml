@@ -1,0 +1,112 @@
+# Website uptime monitor
+#
+# Checks a URL every 5 minutes and sends a push notification when it is down
+# (HTTP 4xx/5xx, timeout, DNS failure, refused connection, bad TLS).
+# No credentials needed.
+#
+# Setup after importing:
+#   1. Install the ntfy app (https://ntfy.sh, iOS/Android/web) and subscribe to
+#      a hard-to-guess topic, e.g. uptime-k3x9q2. ntfy topics are public, so
+#      anyone who knows the name can read them.
+#   2. Variables panel:
+#        SITE_URL   URL to check, e.g. https://example.com/health
+#        ALERT_URL  https://ntfy.sh/<your-topic>
+#   3. Activate the workflow. Change the cron below to check more or less often.
+#
+# Other alert targets: point ALERT_URL at a Slack, Discord or Teams incoming
+# webhook instead, set Content-Type to application/json and change the body to
+#   Slack/Teams: {"text": "..."}     Discord: {"content": "..."}
+# Prefer email? Uncomment the `alert_email` step at the bottom (needs an SMTP
+# credential named `gmail_smtp`).
+#
+# NOTE: there is no alert de-duplication. While the site is down you get one
+# alert per check. Lower the schedule frequency if that is too noisy.
+
+name: Website uptime monitor
+description: Checks a URL every 5 minutes and sends a push alert when it is down.
+version: 1
+triggers:
+  - type: schedule
+    cron: "*/5 * * * *"
+steps:
+  - id: probe
+    type: script
+    label: Check site
+    language: bash
+    timeout: 60000
+    env:
+      SITE_URL: "{{ variables.SITE_URL }}"
+    # stdout is the step output: exactly "up", or "down: <reason>".
+    # Logs go to stderr so they don't pollute the output.
+    script: |
+      set -uo pipefail
+
+      case "$SITE_URL" in
+        http://*|https://*) ;;
+        *)
+          echo "[probe] ERROR: set the SITE_URL workflow variable to an http(s) URL" >&2
+          exit 1
+          ;;
+      esac
+
+      if ! command -v curl >/dev/null; then
+        echo "[probe] ERROR: curl is not installed in this environment's image" >&2
+        exit 1
+      fi
+
+      echo "[probe] Checking $SITE_URL" >&2
+      result=$(curl -sS -L -o /dev/null --max-time 20 -w '%{http_code} %{time_total}' "$SITE_URL" 2>/tmp/curl.err)
+      rc=$?
+
+      if [ "$rc" -ne 0 ]; then
+        reason=$(tr -d '\n' < /tmp/curl.err | head -c 200)
+        echo "[probe] Unreachable: curl exit $rc" >&2
+        printf 'down: unreachable (%s)' "$reason"
+        exit 0
+      fi
+
+      code=${result%% *}
+      secs=${result##* }
+      echo "[probe] HTTP $code in ${secs}s" >&2
+
+      if [ "$code" -ge 400 ]; then
+        printf 'down: HTTP %s after %ss' "$code" "$secs"
+      else
+        printf 'up'
+      fi
+
+  - id: is_down
+    type: condition
+    label: Is it down?
+    depends_on:
+      - probe
+    expression: "{{ steps.probe.output }} != up"
+
+  - id: alert
+    type: http
+    label: Push alert
+    branch:
+      of: is_down
+      case: then
+    method: POST
+    url: "{{ variables.ALERT_URL }}"
+    headers:
+      Content-Type: text/plain
+      Title: "DOWN: {{ variables.SITE_URL }}"
+      Priority: high
+      Tags: rotating_light
+    body: "{{ steps.probe.output }}"
+
+  # Optional email alert. Uncomment and set the ALERT_EMAIL variable.
+  # - id: alert_email
+  #   type: email
+  #   label: Email alert
+  #   branch:
+  #     of: is_down
+  #     case: then
+  #   to: "{{ variables.ALERT_EMAIL }}"
+  #   subject: "DOWN: {{ variables.SITE_URL }}"
+  #   body: |
+  #     {{ variables.SITE_URL }} failed its uptime check.
+  #
+  #     Result: {{ steps.probe.output }}
